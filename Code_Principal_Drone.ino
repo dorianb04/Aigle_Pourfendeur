@@ -1,311 +1,553 @@
-/*A faire : 
-* Calibrage gyroscope (optionnel)
-* Conversion données brutes gyroscope (degrées/secondes) (optionnel)
-
-* Communication arduino vers arduino par protocole UART
-* Configurer les coefficients PID 
-* Déterminer les branchements
-* Ne pas oublier de dé-souder les joysticks
-* Configuration boutons et modes. 
-
+/* 
+@AUTOR : Stanislas Brusselle
+Il reste à aller voir dans le registre du processeur ATmega4809 les commandes appropriées permettant les interruptions commande. 
  */
 
-#include <SPI.h>
+
+#include <Wire.h>
 #include <nRF24L01.h>
 #include <RF24.h>
 #include <Servo.h>
-#include <Arduino_LSM9DS1.h>
-#include <Arduino_LPS22HB.h>
-#include <Adafruit_GPS.h>
-#include <SoftwareSerial.h>
- 
-#define None 0
-#define PMTK_SET_NMEA_UPDATE_1HZ  "$PMTK220,1000*1F"
-#define PMTK_SET_NMEA_OUTPUT_RMC "$PMTK314,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0*29"
-#define PMTK_Q_RELEASE "$PMTK605*31"
-#define NMAX 200
+#include <SPI.h>
 
-SoftwareSerial gps(8, 7);
-RF24 radio(3, 2);   // nRF24L01 (CE, CSN)
+////////////////////////////////////////////////////////CONSTANTES////////////////////////////////////////////////////////
+#define PPM_FrLen 27000  
+#define PPM_PulseLen 400
+#define sigPin 2 //C'est la pin de l'arduino qui recevra les info commande
+//Cette pin est primordiale car elle permet de gérer les interruptions.
 
-//constantes et variables de communication radio. 
-const byte address[6] = "00001";
-unsigned long lastReceiveTime = 0;
-unsigned long currentTime = 0;
+#define YAW   0
+#define PITCH 1
+#define ROLL  2
+#define THROTTLE 3
 
-//Constantes et variables de déplacement du drone et autamatismes de vol. 
-float erreur_precedente_x=0,erreur_x=0,variation_erreur_x=0,commande_x=0,somme_erreurs_x=0; 
-float erreur_precedente_y=0,erreur_y=0,variation_erreur_y=0,commande_y=0,somme_erreurs_y=0; 
-float erreur_precedente_z=0,erreur_z=0,variation_erreur_z=0,commande_z=0,somme_erreurs_z=0; 
-//Les paramètres du PID sont à ré-ajuster. 
-float Kp[3], Ki[3], Kd[3]; 
-float refx=0,refy=0, refz=0;
+#define X     0     
+#define Y     1     
+#define Z     2     
 
-//constante de battery et compensation de déchargement batterie. 
-int battery_voltage = 0;
+#define MPU_ADDRESS 0x68  
+#define FREQ        250   
+#define SSF_GYRO    65.5  
 
-//Initilaisation des moteurs brushless (presque le même comportement que des servomoteurs). 
+////////////////////////////////////////////////////////VARIABLES////////////////////////////////////////////////////////
+
+//ESC////////////////////////////////////////////////////////
 Servo ESC1; 
 Servo ESC2;
 Servo ESC3;
 Servo ESC4;
 
-//Initialisation des structures de discution drone-télécommande. 
+//Télécommande////////////////////////////////////////////////////////
+RF24 radio(2, 3); //Branchements peut être à revoir. 
+const uint64_t pipeOut = 0xE8E8F0F0E1LL; 
+
+unsigned long lastReceiveTime = 0;
+unsigned long currentTime = 0;
+
+volatile unsigned int pulse_length[4] = {1000, 1000, 1000, 1000};
+
 typedef struct Data_PACKAGE {
-  byte j1PotX;
-  byte j1PotY;
-  byte j1Button;
-  byte j2PotX;
-  byte j2PotY;
-  byte j2Button;
-  byte pot1;
-  byte pot2;
-  byte tSwitch1;
-  byte tSwitch2;
-  byte button1;
-  byte button2;
-  byte button3;
-  byte button4;
+  
+  byte throttle;
+  byte yaw;
+  byte pitch;
+  byte roll;
+
+  int val_IA;
+  
 }Data_package;
 
-typedef struct PACKAGE_RETURN {
-  float Baro_X;
-  float Baro_Y;
-  float Baro_Z;
-  float Acc_X;
-  float Acc_Y;
-  float Acc_Z;
-  float Temperature; 
-  float Altitude; 
-  float Pression; 
-  char Coord_GPS_RMC[NMAX];
-  int Batterie;
-}Package_return;
-
 Data_package data;
-Package_return data_DRONE; 
 
-void setup(){
+//Variables de l'IMU////////////////////////////////////////////////////////
+int gyro_raw[3] = {0, 0, 0};  
+long gyro_offset[3] = {0, 0, 0};
+float gyro_angle[3]  = {0, 0, 0};
+int acc_raw[3] = {0 , 0 , 0};
+float acc_angle[3] = {0, 0, 0};
+
+long acc_total_vector;
+float measures[3] = {0, 0, 0};
+
+int temperature;
+
+boolean initialized;
+
+unsigned int  period; 
+unsigned long loop_timer;
+
+float angular_motions[3] = {0, 0, 0};
+
+//Signal ESC////////////////////////////////////////////////////////
+
+unsigned long now, difference;
+
+unsigned long pulse_length_esc1 = 1000,
+        pulse_length_esc2 = 1000,
+        pulse_length_esc3 = 1000,
+        pulse_length_esc4 = 1000;
+
+//Correcteur PID////////////////////////////////////////////////////////
+
+float pid_set_points[3] = {0, 0, 0}; // Yaw, Pitch, Roll
+
+float errors[3];                     
+float delta_err[3]      = {0, 0, 0}; 
+float error_sum[3]      = {0, 0, 0}; 
+float previous_error[3] = {0, 0, 0}; 
+
+float Kp[3] = {4.0, 1.3, 1.3};   //A REGLER SELON LES DIMENSIONS DE NOTRE DRONE
+float Ki[3] = {0.02, 0.04, 0.04}; 
+float Kd[3] = {0, 18, 18};        
+
+//Batterie////////////////////////////////////////////////////////
+
+int battery_voltage;
+
+////////////////////////////////////////////////////////VOID SETUP////////////////////////////////////////////////////////
+
+void setup() {
+
+  Wire.begin();
   
-  Serial.begin(9600);
+//Cette commande fonctionne avec une arduino Uno mais pas avec une Arduino Nano Every. Il reste à voir si celle-ci est réellement utile. 
+//La commande permet en principe de fixer l'horloge I2C à une vitesse de 400kHz. 
+  //TWBR = 12; 
+
+  setupMpu6050Registers();
+  calibrateMpu6050();
+
   radio.begin();
-  gps.begin(9600);
-  delay(2000);
-   
-  Serial.println("Demarrage : IMU");
-  Serial.println("Demarrage : capteur pression/temperature");
-  Serial.println("Demarrage : GPS trame RMC");
-
-  if (!IMU.begin()) {
-    Serial.println("Echec : demarrage IMU!");
-    while (1);
-  }
-
-  if (!BARO.begin()) {
-    Serial.println("Echec : demarrage capteur pression/temperature !");
-    while (1);
-  }
-
-//Le GPS utilise le protocole NMEA. 
-  gps.println(PMTK_SET_NMEA_OUTPUT_RMC);
-  gps.println(PMTK_SET_NMEA_UPDATE_1HZ);
-  gps.println(PMTK_Q_RELEASE);
-  
-  radio.openReadingPipe(0, address);
+  radio.openReadingPipe(1, pipeOut);
   radio.setAutoAck(false);
   radio.setDataRate(RF24_250KBPS);
   radio.setPALevel(RF24_PA_LOW);
-  radio.startListening(); //Initialise le modul en recepteur. 
-
-  Serial.println("Initialisation achevee");
-
-  ESC1.attach(None); //PIN A DEFINIR.
-  ESC2.attach(None); //PIN A DEFINIR.
-  ESC3.attach(None); //PIN A DEFINIR.
-  ESC4.attach(None); //PIN A DEFINIR.
-
-//compléter refx, refy et refz par les valeurs d'initialisation du gyroscope. 
-}
-
-void loop(){
-  
-//L'impulsion électrique de controle des Brushless motors se fait entre 1000 et 2000 µs.  
-//J'établi une relation entre les valeurs de control des moteurs et les valeurs prises par les variables des joysticks. 
-//Mesures 10 à 400 seront peut être à changer pour éviter que le drone ne se retourne. 
-  float commande_j1PotY_up_down = map(data.j1PotY, 0, 255, 1000, 2000);
-  float commande_j1PotX_right = map(data.j1PotX, 127, 255, 10, 400);
-  float commande_j1PotX_left = map(data.j1PotX, 0, 127, 10, 400);
-  
-  float commande_j2PotY_front = map(data.j2PotY, 127, 255, 10, 400);
-  float commande_j2PotY_back = map(data.j2PotY, 0, 127, 10, 400);
-  float commande_j2PotX_right = map(data.j2PotX, 127, 255, 10, 400);
-  float commande_j2PotX_left = map(data.j2PotX, 0, 127, 10, 400);
-
-//Valeurs de l'impulsion électrique à envoyer aux moteurs. 
-  float pulse_length_esc1;
-  float pulse_length_esc2;
-  float pulse_length_esc3;
-  float pulse_length_esc4;
-  
-///////////////////////////////////////////////////////////////////////////////////////////////////
-//PARTIE RECU ET INTERPRETATION DU PACKAGE DONNEES DE TELECOMMANDE. 
-///////////////////////////////////////////////////////////////////////////////////////////////////
-
   radio.startListening(); //Initialise le module en recepteur. 
-
-// Le if agit comme une sorte de sécurité, si le signal est perdu ou inchangé : retourne aux paramètres de controle initiaux.
-  currentTime = millis();
-  if ( currentTime - lastReceiveTime > 1000 ) {
-    resetData(); 
-  }
-
-//Check s'il y a des données à recevoir. 
-  if (radio.available()) {
-    radio.read(&data, sizeof(Data_package));
-    lastReceiveTime = millis();//Marque les données comme reçues à cet instant t. 
-  }
-
-//////////////////////////////////////////////////////////////////////////////////////////////////
-//PARTIE CONTROL ET AUTOMATISMES DE VOL. 
-//////////////////////////////////////////////////////////////////////////////////////////////////
-
-  if (IMU.gyroscopeAvailable()) {
-    IMU.readGyroscope(data_DRONE.Baro_X, data_DRONE.Baro_Y, data_DRONE.Baro_Z);
-  }
-//J'utilise un correcteur PID sur les axes x, y et z.
-  erreur_x = data_DRONE.Baro_X - refx;
-  erreur_y = data_DRONE.Baro_Y - refy;
-  erreur_z = data_DRONE.Baro_Z - refz;
   
-  somme_erreurs_x +=erreur_x;
-  somme_erreurs_y +=erreur_y;
-  somme_erreurs_z +=erreur_z;
-
-  variation_erreur_x = erreur_x - erreur_precedente_x;
-  variation_erreur_y = erreur_y - erreur_precedente_y;
-  variation_erreur_z = erreur_z - erreur_precedente_z;
-
-  commande_x = Kp[0]*erreur_x + Ki[0]*somme_erreurs_x + Kd[0]*variation_erreur_x;
-  commande_y = Kp[1]*erreur_x + Ki[1]*somme_erreurs_y + Kd[1]*variation_erreur_y;
-  commande_z = Kp[2]*erreur_z + Ki[2]*somme_erreurs_z + Kd[2]*variation_erreur_z;  
-
-  erreur_precedente_x = erreur_x;
-  erreur_precedente_y = erreur_y;
-  erreur_precedente_z = erreur_z; 
-
-//commande_x et commande_y sont les variables de correction de trajectoire. 
-
-  pulse_length_esc1 = commande_j1PotY_up_down - commande_x - commande_y + commande_z + commande_j2PotY_back + commande_j2PotX_left + commande_j1PotX_left;
-  pulse_length_esc2 = commande_j1PotY_up_down + commande_x - commande_y - commande_z + commande_j2PotY_back + commande_j2PotX_right + commande_j1PotX_right;
-  pulse_length_esc3 = commande_j1PotY_up_down - commande_x + commande_y - commande_z + commande_j2PotY_front + commande_j2PotX_left + commande_j1PotX_right;
-  pulse_length_esc4 = commande_j1PotY_up_down + commande_x + commande_y + commande_z + commande_j2PotY_front + commande_j2PotX_right + commande_j1PotX_left;
-
-  pulse_length_esc1 = minMax(pulse_length_esc1, 1100, 2000);
-  pulse_length_esc2 = minMax(pulse_length_esc2, 1100, 2000);
-  pulse_length_esc3 = minMax(pulse_length_esc3, 1100, 2000);
-  pulse_length_esc4 = minMax(pulse_length_esc4, 1100, 2000);
+  resetData();
   
-  ESC1.write(pulse_length_esc1);
-  ESC2.write(pulse_length_esc2);
-  ESC3.write(pulse_length_esc3);
-  ESC4.write(pulse_length_esc4);
+  ESC1.attach(4); 
+  ESC2.attach(5); 
+  ESC3.attach(6); 
+  ESC4.attach(7); 
 
-///////////////////////////////////////////////////////////////////////////////////////////////////
-//PARTIE COMPENSATION PERTE DE BATTERIE
-///////////////////////////////////////////////////////////////////////////////////////////////////
-
-  if (isBatteryConnected()) {
-    
-    int coeff = ((1240 - battery_voltage) / (float) 3500);
-    
-    pulse_length_esc1 += pulse_length_esc1 * coeff;
-    pulse_length_esc2 += pulse_length_esc2 * coeff;
-    pulse_length_esc3 += pulse_length_esc3 * coeff;
-    pulse_length_esc4 += pulse_length_esc4 * coeff;
-  }
-  
-///////////////////////////////////////////////////////////////////////////////////////////////////
-//PARTIE ENVOIE PACKAGE DONNEES DRONE VERS TELECOMMANDE. 
-///////////////////////////////////////////////////////////////////////////////////////////////////
-  Traitement_data_DRONE(data_DRONE);
-  radio.write(&data_DRONE, sizeof(Data_package));
+  loop_timer = micros();
+  period = (1000000 / FREQ) ; 
 }
 
-void resetData() {
-//Reset les commandes en cas d'interruption du signal. 
-  data.j1PotX = 127;
-  data.j1PotY = 127;
-  data.j2PotX = 127;
-  data.j2PotY = 127;
-  data.j1Button = 1;
-  data.j2Button = 1;
-  data.pot1 = 1;
-  data.pot2 = 1;
-  data.tSwitch1 = 1;
-  data.tSwitch2 = 1;
-  data.button1 = 1;
-  data.button2 = 1;
-  data.button3 = 1;
-  data.button4 = 1;
+////////////////////////////////////////////////////////VOID LOOP////////////////////////////////////////////////////////
+
+void loop() {
+// 1. Map les données reçues par la télécommande aux différentes valeurs qui doivent leur être associées. 
+  Remote_control();
+  
+// 2. Données brutes de l'IMU. 
+  readSensor();
+
+// 3. Calcule les angles du drone selon chaque axe. 
+  calculateAngles();
+
+// 4. Calcule les consignes de correction selon chaque axe.
+  calculateSetPoints();
+
+// 5. En déduis l'erreur entre les set_points et les angles réels. 
+  calculateErrors();
+
+// 6. Corrige les impulsions à donner aux ESC. 
+  Correcteur_PID();
+
+// 7. Gère la perte de batterie. 
+  compensateBatteryDrop();
+
+// 8. Envoie les impulsions déterminées aux ESC. 
+    Impulsion_ESC();
+}
+
+
+////////////////////////////////////////////////////////FONCTIONS////////////////////////////////////////////////////////
+
+////////////////////////////////////////////////////////MPU 6050////////////////////////////////////////////////////////
+  void setupMpu6050Registers() {
+//Permet l'initialisation du MPU 6050
+
+  Wire.beginTransmission(MPU_ADDRESS); 
+  Wire.write(0x6B);                    
+  Wire.write(0x00);                    
+  Wire.endTransmission();              
+  
+  Wire.beginTransmission(MPU_ADDRESS); 
+  Wire.write(0x1B);                    
+  Wire.write(0x08);                    
+  Wire.endTransmission();              
+     
+  Wire.beginTransmission(MPU_ADDRESS); 
+  Wire.write(0x1C);                    
+  Wire.write(0x10);                    
+  Wire.endTransmission(); 
+          
+  Wire.beginTransmission(MPU_ADDRESS); 
+  Wire.write(0x1A);                    
+  Wire.write(0x03);                    
+  Wire.endTransmission();             
+}
+
+void calibrateMpu6050(){
+//Calibre le MPU 6050 en prenant la moyenne glissante de 2000 relevés. 
+//Cette fonction sert à gérer l'offset. 
+  
+  int max_samples = 2000;
+  
+  for (int i = 0; i < max_samples; i++) {
+    
+    readSensor();
+    
+    gyro_offset[X] += gyro_raw[X];
+    gyro_offset[Y] += gyro_raw[Y];
+    gyro_offset[Z] += gyro_raw[Z];
+    delay(3);
+  }
+  
+  gyro_offset[X] /= max_samples;
+  gyro_offset[Y] /= max_samples;
+  gyro_offset[Z] /= max_samples;
+}
+
+void readSensor() {
+//Lit les données brutes renvoyées par l'accéléromètre et le gyroscope et les stock dans les tableaux associés. 
+
+  Wire.beginTransmission(MPU_ADDRESS); 
+  Wire.write(0x3B);                   
+  Wire.endTransmission();              
+  Wire.requestFrom(MPU_ADDRESS, 14);  
+  
+  while (Wire.available() < 14);
+  
+  acc_raw[X]  = Wire.read() << 8 | Wire.read(); // Add the low and high byte to the acc_raw[X] variable
+  acc_raw[Y]  = Wire.read() << 8 | Wire.read(); // Add the low and high byte to the acc_raw[Y] variable
+  acc_raw[Z]  = Wire.read() << 8 | Wire.read(); // Add the low and high byte to the acc_raw[Z] variable
+  temperature = Wire.read() << 8 | Wire.read(); // Add the low and high byte to the temperature variable
+  gyro_raw[X] = Wire.read() << 8 | Wire.read(); // Add the low and high byte to the gyro_raw[X] variable
+  gyro_raw[Y] = Wire.read() << 8 | Wire.read(); // Add the low and high byte to the gyro_raw[Y] variable
+  gyro_raw[Z] = Wire.read() << 8 | Wire.read(); // Add the low and high byte to the gyro_raw[Z] variable
+}
+  
+void calculateAngles(){
+//Fais les corrélation entre les angles donnés par le gyroscope et l'accéléromètre pour renvoyer l'inclinaison de l'assiette
+//selon le pitch, yaw et roll. 
+
+  calculateGyroAngles();
+  calculateAccelerometerAngles();
+  
+  if (initialized) {
+    
+    gyro_angle[X] = gyro_angle[X] * 0.9996 + acc_angle[X] * 0.0004;
+    gyro_angle[Y] = gyro_angle[Y] * 0.9996 + acc_angle[Y] * 0.0004;
+  } 
+  else {
+
+    gyro_angle[X] = acc_angle[X];
+    gyro_angle[Y] = acc_angle[Y];
+    initialized = true;
+   }
+    
+  measures[ROLL]  = measures[ROLL]  * 0.9 + gyro_angle[X] * 0.1;
+  measures[PITCH] = measures[PITCH] * 0.9 + gyro_angle[Y] * 0.1;
+  measures[YAW]   = -gyro_raw[Z] / SSF_GYRO; 
+}
+   
+void calculateGyroAngles(){
+//Utilise les données brutes récupérées par le gyroscope pour les transformer en angles en degrés. 
+  
+  gyro_raw[X] -= gyro_offset[X];
+  gyro_raw[Y] -= gyro_offset[Y];
+  gyro_raw[Z] -= gyro_offset[Z];
+  
+  gyro_angle[X] += (gyro_raw[X] / (FREQ * SSF_GYRO));
+  gyro_angle[Y] += (-gyro_raw[Y] / (FREQ * SSF_GYRO)); 
+  
+  gyro_angle[Y] += gyro_angle[X] * sin(gyro_raw[Z] * (PI / (FREQ * SSF_GYRO * 180)));
+  gyro_angle[X] -= gyro_angle[Y] * sin(gyro_raw[Z] * (PI / (FREQ * SSF_GYRO * 180)));
+ }
+    
+void calculateAccelerometerAngles(){
+//Utilise les données brutes récupérées par l'accéléromètre pour les transformer en angles en degrés. 
+
+  acc_total_vector = sqrt(pow(acc_raw[X], 2) + pow(acc_raw[Y], 2) + pow(acc_raw[Z], 2));
+  
+  if (abs(acc_raw[X]) < acc_total_vector) {
+    acc_angle[X] = asin((float)acc_raw[Y] / acc_total_vector) * (180 / PI);
+  }
+  
+  if (abs(acc_raw[Y]) < acc_total_vector) {
+    acc_angle[Y] = asin((float)acc_raw[X] / acc_total_vector) * (180 / PI);
+  }
+}
+
+////////////////////////////////////////////////////////CORRECTEUR PID////////////////////////////////////////////////////////
+
+float calculateSetPoint(float angle, int channel_pulse) {
+//Prend en entrée : un angle en degrés et la durée en µs de l'impulsion reçue pour l'axe (comprise entre 1000µs et 2000µs)
+//Calcule la consigne d'un angle pour un axe.
+//Interprète un angle donné pour en déduire une consigne exploitable par le correcteur PID. 
+//Retourne la consigne en degrés/seconde pour la correction.
+
+    float level_adjust = angle * 15;
+    float set_point    = 0;
+
+    // On s'accorde une marge 16µs pour de meilleurs résultats
+    if (channel_pulse > 1508) {
+        set_point = channel_pulse - 1508;
+    } else if (channel_pulse <  1492) {
+        set_point = channel_pulse - 1492;
+    }
+
+    set_point -= level_adjust;
+    set_point /= 3;
+
+    return set_point;
+}
+
+float calculateYawSetPoint(int yaw_pulse, int throttle_pulse) {
+//Calcul le set_point pour l'axe YAW. 
+    float set_point = 0;
+    if (throttle_pulse > 1050) {
+//Il n'y a pas de notion d'angle sur le YAW car le drone peut tourner sur lui même
+        set_point = calculateSetPoint(0, yaw_pulse);
+    }
+    return set_point;
+}
+
+void calculateSetPoints() {
+//Calcule le set_point selon tous les axes.
+    pid_set_points[YAW]   = calculateYawSetPoint(pulse_length[YAW], pulse_length[THROTTLE]);
+    pid_set_points[PITCH] = calculateSetPoint(measures[PITCH], pulse_length[PITCH]);
+    pid_set_points[ROLL]  = calculateSetPoint(measures[ROLL], pulse_length[ROLL]);
+}
+
+void calculateErrors() {
+//Calcule les erreurs relatives a chaque axe. 
+//Pour calculer les erreurs, se base sur la formule du PID 
+  
+//Calcule l'erreur actuelle.
+    errors[YAW]   = angular_motions[YAW]   - pid_set_points[YAW];
+    errors[PITCH] = angular_motions[PITCH] - pid_set_points[PITCH];
+    errors[ROLL]  = angular_motions[ROLL]  - pid_set_points[ROLL];
+
+//Calcule la somme des erreurs (intégration)
+    error_sum[YAW]   += errors[YAW];
+    error_sum[PITCH] += errors[PITCH];
+    error_sum[ROLL]  += errors[ROLL];
+
+    error_sum[YAW]   = minMax(error_sum[YAW],   -400/Ki[YAW],   400/Ki[YAW]);
+    error_sum[PITCH] = minMax(error_sum[PITCH], -400/Ki[PITCH], 400/Ki[PITCH]);
+    error_sum[ROLL]  = minMax(error_sum[ROLL],  -400/Ki[ROLL],  400/Ki[ROLL]);
+
+//(dérivation)
+    delta_err[YAW]   = errors[YAW]   - previous_error[YAW];
+    delta_err[PITCH] = errors[PITCH] - previous_error[PITCH];
+    delta_err[ROLL]  = errors[ROLL]  - previous_error[ROLL];
+
+    previous_error[YAW]   = errors[YAW];
+    previous_error[PITCH] = errors[PITCH];
+    previous_error[ROLL]  = errors[ROLL];
+}
+
+
+void Correcteur_PID() {
+//Renvoie les impulsions de correction de l'assiette du drone. 
+
+    float yaw_pid      = 0;
+    float pitch_pid    = 0;
+    float roll_pid     = 0;
+    int   throttle     = pulse_length[THROTTLE];
+
+    pulse_length_esc1 = throttle;
+    pulse_length_esc2 = throttle;
+    pulse_length_esc3 = throttle;
+    pulse_length_esc4 = throttle;
+
+//Ne calcule rien si la commande des gazs (throttle) est égale à 0
+    if (throttle >= 1012) {
+        // PID = e.Kp + ∫e.Ki + Δe.Kd
+        yaw_pid   = (errors[YAW]   * Kp[YAW])   + (error_sum[YAW]   * Ki[YAW])   + (delta_err[YAW]   * Kd[YAW]);
+        pitch_pid = (errors[PITCH] * Kp[PITCH]) + (error_sum[PITCH] * Ki[PITCH]) + (delta_err[PITCH] * Kd[PITCH]);
+        roll_pid  = (errors[ROLL]  * Kp[ROLL])  + (error_sum[ROLL]  * Ki[ROLL])  + (delta_err[ROLL]  * Kd[ROLL]);
+
+        yaw_pid   = minMax(yaw_pid, -400, 400);
+        pitch_pid = minMax(pitch_pid, -400, 400);
+        roll_pid  = minMax(roll_pid, -400, 400);
+
+        pulse_length_esc1 = throttle - roll_pid - pitch_pid + yaw_pid;
+        pulse_length_esc2 = throttle + roll_pid - pitch_pid - yaw_pid;
+        pulse_length_esc3 = throttle - roll_pid + pitch_pid - yaw_pid;
+        pulse_length_esc4 = throttle + roll_pid + pitch_pid + yaw_pid;
+    }
+
+//Garde les impulsion dans le range acceptable de valeur. 
+    pulse_length_esc1 = minMax(pulse_length_esc1, 1100, 2000);
+    pulse_length_esc2 = minMax(pulse_length_esc2, 1100, 2000);
+    pulse_length_esc3 = minMax(pulse_length_esc3, 1100, 2000);
+    pulse_length_esc4 = minMax(pulse_length_esc4, 1100, 2000);
+}
+
+////////////////////////////////////////////////////////COMPENSATION PERTE BATTERIE////////////////////////////////////////////////////////
+
+void compensateBatteryDrop() {
+//Compense la perte de batterie du drone en appliquant un coefficient aux impulsions des ESC. 
+
+    if (isBatteryConnected()) {
+        int coeff = ((1240 - battery_voltage) / (float) 3500);
+
+        pulse_length_esc1 += pulse_length_esc1 * coeff;
+        pulse_length_esc2 += pulse_length_esc2 * coeff;
+        pulse_length_esc3 += pulse_length_esc3 * coeff;
+        pulse_length_esc4 += pulse_length_esc4 * coeff;
+    }
 }
 
 bool isBatteryConnected() {
-    // J'applique un simple filtre passe-bas pour filtrer le signal (Fc ≈ 10Hz et gain de ~2.5dB dans la bande passante)
+//Vérifie que la batterie soit bien connectée. 
+//Renvoie TRUE si la batterie est connectée.
+  
+    // On applique un simple filtre passe-bas pour filtrer le signal (Fc ≈ 10Hz et gain de ~2.5dB dans la bande passante)
     battery_voltage = battery_voltage * 0.92 + (analogRead(0) + 65) * 0.09853;
 
     return battery_voltage < 1240 && battery_voltage > 800;
 }
 
-void Traitement_data_DRONE(Package_return data_D){
-//Envoie les données relevées par le drone à la télécommande. 
-  int i=0;
-  int VAL_STOP=0;
-  char RMC[NMAX];
-  
-//Capteur LSM9DS1. 
-/*
-//Ignoré car déjà calculé avant pour l'équilibrage de l'assiette. 
-  if (IMU.gyroscopeAvailable()) {
-    IMU.readGyroscope(data_D.Baro_X, data_D.Baro_Y, data_D.Baro_Z);
-  }
-*/
-  if (IMU.accelerationAvailable()) {
-    IMU.readAcceleration(data_D.Acc_X, data_D.Acc_Y, data_D.Acc_Z);
-  } 
-   
-//capteur LPS22HB. 
-  data_DRONE.Pression = BARO.readPressure();
-  data_DRONE.Altitude = 44330 * ( 1 - pow(data_DRONE.Pression/101.325, 1/5.255)); 
-  data_D.Temperature = BARO.readTemperature();
+////////////////////////////////////////////////////////IMPULSION ESC////////////////////////////////////////////////////////
 
-  data_D.Batterie = battery_voltage; 
-  
-//Capteur GPS. 
-//$__RMC,heure,validité des donnees,latitude,pôle latitude,longitude,pôle longitude,vitesse en noeuds,,date,,,A*7B
-    while(VAL_STOP<1){
-    if (gps.available()) {
-
-      delay(10);
-      
-      char c = gps.read(); 
-      data_D.Coord_GPS_RMC[i]=c;
-     
-      i++;
-      
-      if(c=='\n'){
-        VAL_STOP+=1;
-      }     
-     }
-  } 
+void Impulsion_ESC(){
+  ESC1.write(pulse_length_esc1);
+  ESC2.write(pulse_length_esc2);
+  ESC3.write(pulse_length_esc3);
+  ESC4.write(pulse_length_esc4);
 }
 
-float minMax( float valeur_encadree, float minimum, float maximum){
-  if(valeur_encadree > maximum){
-    Serial.println("Valeur encadree trop elevee");
-    return maximum;
+////////////////////////////////////////////////////////RADIO////////////////////////////////////////////////////////
+
+void Remote_control(){
+//Reçoit les remote controls et les interprète pour venir les mettre dans le tableau pulse_lenght[4].
+
+  currentTime = millis();
+  if ( currentTime - lastReceiveTime > 1000 ) { 
+    resetData(); //Reset les commandes si la connection est perdue. 
   }
-  if(valeur_encadree < minimum){
-    Serial.println("Valeur encadree trop faible");
-    return minimum;
+
+//Vérifie s'il y a des données à recevoir.
+  if (radio.available()) {
+    radio.read(&data, sizeof(Data_package)); //Lit les données reçues et les stock dans la structure data.
+    lastReceiveTime = millis();
   }
+
+  if (AIGLE_POURFENDEUR_DES_PLAINES_ARIDES()==0){
+
+    mapping_commands();
+    
+  }
+  else{
+//Ici ce trouveront toute les commande pour le tracking IA
+  }
+}
+
+void resetData() {
+  // Reset l'ensemble des commandes remote. 
+  data.throttle = 0;
+  data.yaw = 127;
+  data.pitch = 127;
+  data.roll = 127;
+  data.val_IA = 0;
+
+  mapping_commands();
+}
+
+void mapping_commands(){
+//Map les valeurs des joysticks aux valeurs aux valeurs d'impulsion des ESC.
+    pulse_length[THROTTLE] = map(data.throttle, 0, 255, 1000, 2000);//Pour le throttle.
+    pulse_length[YAW] = map(data.yaw, 0, 255, 1000, 2000);//Pour le yaw.
+    pulse_length[PITCH] = map(data.pitch, 0, 255, 1000, 2000);//Pour le pitch.
+    pulse_length[ROLL] = map(data.roll, 0, 255, 1000, 2000);//Pour le roll.
+}
+
+void setupPPM() {
+//Initialise la procédure d'interruption commande du drone. 
+
+  pinMode(sigPin, OUTPUT);
+  digitalWrite(sigPin, 0);  
+
+//J'utilise ici du langage processeur. Problème : ce langage est prévu pour les processeurs d'arduino uno et non d'arduino Nano Every ! 
+//Il va donc falloir que j'aille voir dans les register de la Nano Every pour voir quelle commande processeur sont équivalentes 
+//à celles que j'utilise ci-dessous. 
+  cli();
+  TCCR1A = 0; 
+  TCCR1B = 0;
+
+  OCR1A = 100;  
+  TCCR1B |= (1 << WGM12); 
+  TCCR1B |= (1 << CS11);  
+  TIMSK1 |= (1 << OCIE1A); 
+  sei();
+}
+
+//Cette partie de code ne vient pas de moi, mais permet les interruptions commande du programme. 
+
+#define clockMultiplier 2 // set this to 2 if you are using a 16MHz arduino, leave as 1 for an 8MHz arduino
+
+ISR(TIMER1_COMPA_vect){
+  static boolean state = true;
+
+  TCNT1 = 0;
+
+  if ( state ) {
+    //end pulse
+    PORTD = PORTD & ~B00000100; // turn pin 2 off. Could also use: digitalWrite(sigPin,0)
+    OCR1A = PPM_PulseLen * clockMultiplier;
+    state = false;
+  }
+  else {
+    //start pulse
+    static byte cur_chan_numb;
+    static unsigned int calc_rest;
+
+    PORTD = PORTD | B00000100; // turn pin 2 on. Could also use: digitalWrite(sigPin,1)
+    state = true;
+
+    if(cur_chan_numb >= channel_number) {
+      cur_chan_numb = 0;
+      calc_rest += PPM_PulseLen;
+      OCR1A = (PPM_FrLen - calc_rest) * clockMultiplier;
+      calc_rest = 0;
+    }
+    else {
+      OCR1A = (ppm[cur_chan_numb] - PPM_PulseLen) * clockMultiplier;
+      calc_rest += ppm[cur_chan_numb];
+      cur_chan_numb++;
+    }     
+  }
+}
+
+
+////////////////////////////////////////////////////////FONCTION MATHS////////////////////////////////////////////////////////
+
+float minMax(float value, float min_value, float max_value) {
+    if (value > max_value) {
+        value = max_value;
+    } else if (value < min_value) {
+        value = min_value;
+    }
+    return value;
+}
+
+////////////////////////////////////////////////////////FONCTIONS MODES DE VOL////////////////////////////////////////////////////////
+
+int AIGLE_POURFENDEUR_DES_PLAINES_ARIDES(){
+//Permet la sélection des différents mode du drone. 
+//Si la fonction renvoie 1, alors les commandes joystick ne seront plus prises en compte. Dans le cas contraire, 
+//les commandes joysticks sont toujours utilisées. 
+ 
+  if (data.val_IA == 1) {
+    //MODE IA DRONE SUIVI
+    return 1;
+  }
+  return 0;
 }
