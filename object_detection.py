@@ -157,7 +157,7 @@ while type(image) is np.ndarray:
     print("% delta x : ", dcenter_X)
     print('% delta y :', dcenter_Y)
     print("\n")
-    trackFace(delta_x=dcenter_X, delta_y=dcenter_Y, ratio_area=ratio_area)
+    trackPerson(delta_x=dcenter_X, delta_y=dcenter_Y, ratio_area=ratio_area)
 
     cv2.imshow("image", image)
     if ord("q") == cv2.waitKey(1):
