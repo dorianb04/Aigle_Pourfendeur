@@ -1,6 +1,12 @@
 /* 
 @AUTOR : Stanislas Brusselle
-Il reste à aller voir dans le registre du processeur ATmega4809 les commandes appropriées permettant les interruptions commande. 
+Code adapté a l'ATmega 328p
+
+Branchements IMU: 
+Leonardo : SCL -> 3, SDA -> 2 ou SCL -> SCL, SDA -> SDA
+Nano Every : SCL -> D19, SDA -> D18
+Vin -> 3,3v
+GND -> GND 
  */
 
 
@@ -32,10 +38,15 @@ Il reste à aller voir dans le registre du processeur ATmega4809 les commandes a
 ////////////////////////////////////////////////////////VARIABLES////////////////////////////////////////////////////////
 
 //ESC////////////////////////////////////////////////////////
+
+
 Servo ESC1; 
 Servo ESC2;
 Servo ESC3;
 Servo ESC4;
+
+Servo Dir_CAM;
+
 
 //Télécommande////////////////////////////////////////////////////////
 RF24 radio(2, 3); //Branchements peut être à revoir. 
@@ -130,6 +141,8 @@ void setup() {
   ESC2.attach(5); 
   ESC3.attach(6); 
   ESC4.attach(7); 
+
+  Dir_CAM.attach(13);
 
   loop_timer = micros();
   period = (1000000 / FREQ) ; 
