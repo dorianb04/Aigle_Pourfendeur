@@ -49,9 +49,10 @@ IOU_THRESHOLD = .1
 font_scale = 1
 thickness = 1
 
-config_f = 'darknet/cfg/yolov4-tiny.cfg'
-weights_f = 'darknet/weights/yolov4-tiny.weights'
-coco_f = 'darknet/data/coco.names'
+video_link = 'testvideo/Top 5 hikes in Orange County (Drone footage & directions)_Trim.mp4'
+config_f = 'cfg/yolov4-tiny.cfg'
+weights_f = 'weights/yolov4-tiny.weights'
+coco_f = 'coco.names'
 
 labels = open(coco_f, 'r').read().strip().split("\n")
 
@@ -62,10 +63,7 @@ network = cv2.dnn.readNetFromDarknet(config_f, weights_f)
 ln = network.getLayerNames()
 ln = [ln[i - 1] for i in network.getUnconnectedOutLayers()]
 
-cap = cv2.VideoCapture('testvideo/alone_itw.mp4')
-# cap = cv2.VideoCapture('testvideo/2022-04-25 19-33-59.mp4')
-# cap = cv2.VideoCapture('testvideo/Top 5 hikes in Orange County (Drone footage & directions)_Trim.mp4')
-# cap = cv2.VideoCapture(0)
+cap = cv2.VideoCapture(video)
 
 
 _, image = cap.read()
