@@ -1,352 +1,286 @@
-/* 
+/*
 @AUTOR : Stanislas Brusselle
 Code adapté a l'ATmega 328p
 
-Branchements IMU: 
-Leonardo : SCL -> 3, SDA -> 2 ou SCL -> SCL, SDA -> SDA
-Nano Every : SCL -> D19, SDA -> D18
-Vin -> 3,3v
-GND -> GND 
- */
+Branchements --------------------------------------------------------------------------------------------
+RC : 
+Channel 1 -> 5, Channel 2 -> 6, Channel 3 -> 7, Channel 4 -> 8;
 
+IMU : 
+SDA -> SDA, SCL -> SCL, VIN -> 3.3v, GND -> GND;
 
+ESC : 
+esc1 -> 4, esc2 -> 5, esc3 -> 6, esc4 -> 7;
+
+Lien utile --------------------------------------------------------------------------------------------
+https://www.firediy.fr/article/realisation-d-un-drone-a-base-d-arduino-chapitre-1
+*/
+
+//LIBRAIRIES --------------------------------------------------------------------------------------------
 #include <Wire.h>
-#include <nRF24L01.h>
-#include <RF24.h>
-#include <Servo.h>
-#include <SPI.h>
+#include "Kalman_etendu.h"
 
-////////////////////////////////////////////////////////CONSTANTES////////////////////////////////////////////////////////
-#define PPM_FrLen 27000  
-#define PPM_PulseLen 400
-#define sigPin 2 //C'est la pin de l'arduino qui recevra les info commande
-//Cette pin est primordiale car elle permet de gérer les interruptions.
+//CONSTANTES --------------------------------------------------------------------------------------------
+#define CHANNEL1 0
+#define CHANNEL2 1
+#define CHANNEL3 2
+#define CHANNEL4 3
 
-#define YAW   0
-#define PITCH 1
-#define ROLL  2
+#define YAW      0
+#define PITCH    1
+#define ROLL     2
 #define THROTTLE 3
 
-#define X     0     
-#define Y     1     
-#define Z     2     
+#define X           0     
+#define Y           1     
+#define Z           2   
 
 #define MPU_ADDRESS 0x68  
 #define FREQ        250   
 #define SSF_GYRO    65.5  
 
-////////////////////////////////////////////////////////VARIABLES////////////////////////////////////////////////////////
+//VARIABLES --------------------------------------------------------------------------------------------
+//RC ------------------------ 
+char mode = '0';
 
-//ESC////////////////////////////////////////////////////////
+//IMU ------------------------ 
+volatile byte previous_state[5];
+
+volatile unsigned int motor_pulse[4] = {1500, 1500, 1000, 1500};
+
+volatile unsigned long current_time;
+volatile unsigned long timer[4]; 
 
 
-Servo ESC1; 
-Servo ESC2;
-Servo ESC3;
-Servo ESC4;
+int mode_mapping[4];
 
-Servo Dir_CAM;
-
-
-//Télécommande////////////////////////////////////////////////////////
-RF24 radio(2, 3); //Branchements peut être à revoir. 
-const uint64_t pipeOut = 0xE8E8F0F0E1LL; 
-
-unsigned long lastReceiveTime = 0;
-unsigned long currentTime = 0;
-
-volatile unsigned int pulse_length[4] = {1000, 1000, 1000, 1000};
-
-typedef struct Data_PACKAGE {
-  
-  byte throttle;
-  byte yaw;
-  byte pitch;
-  byte roll;
-
-  int val_IA;
-  
-}Data_package;
-
-Data_package data;
-
-//Variables de l'IMU////////////////////////////////////////////////////////
-int gyro_raw[3] = {0, 0, 0};  
+int gyro_raw[3] = {0,0,0};
 long gyro_offset[3] = {0, 0, 0};
-float gyro_angle[3]  = {0, 0, 0};
-int acc_raw[3] = {0 , 0 , 0};
-float acc_angle[3] = {0, 0, 0};
+float gyro_angle[3]  = {0,0,0};
 
+int acc_raw[3] = {0 ,0 ,0};
+float acc_angle[3] = {0,0,0};
 long acc_total_vector;
-float measures[3] = {0, 0, 0};
-
+float angle_IMU[3] = {0, 0, 0};
+float data_measures[3] = {0, 0, 0};
 int temperature;
 
 boolean initialized;
 
 unsigned int  period; 
 unsigned long loop_timer;
-
-float angular_motions[3] = {0, 0, 0};
-
-//Signal ESC////////////////////////////////////////////////////////
-
 unsigned long now, difference;
 
-unsigned long pulse_length_esc1 = 1000,
-        pulse_length_esc2 = 1000,
-        pulse_length_esc3 = 1000,
-        pulse_length_esc4 = 1000;
+//ESC ------------------------ 
 
-//Correcteur PID////////////////////////////////////////////////////////
+unsigned long pulse_ESC1 = 1000,
+              pulse_ESC2 = 1000,
+              pulse_ESC3 = 1000,
+              pulse_ESC4 = 1000;
 
-float pid_set_points[3] = {0, 0, 0}; // Yaw, Pitch, Roll
-
+//PID ------------------------ 
+float pid_consignes[3] = {0, 0, 0}; 
 float errors[3];                     
 float delta_err[3]      = {0, 0, 0}; 
 float error_sum[3]      = {0, 0, 0}; 
 float previous_error[3] = {0, 0, 0}; 
 
-float Kp[3] = {4.0, 1.3, 1.3};   //A REGLER SELON LES DIMENSIONS DE NOTRE DRONE
+float Kp[3] = {4.0, 1.3, 1.3};   
 float Ki[3] = {0.02, 0.04, 0.04}; 
 float Kd[3] = {0, 18, 18};        
 
-//Batterie////////////////////////////////////////////////////////
-
-int battery_voltage;
-
-////////////////////////////////////////////////////////VOID SETUP////////////////////////////////////////////////////////
-
+//VOID SETUP --------------------------------------------------------------------------------------------
 void setup() {
+    Serial.begin(9600);
+    Wire.begin();
+//Regle l'horloge à 400
+    TWBR = 12; 
+//PLace les broches liées au canaux 5, 6, 7, 8 en entrée
+    DDRD |= B11110000;
 
-  Wire.begin();
-  
-//Cette commande fonctionne avec une arduino Uno mais pas avec une Arduino Nano Every. Il reste à voir si celle-ci est réellement utile. 
-//La commande permet en principe de fixer l'horloge I2C à une vitesse de 400kHz. 
-  //TWBR = 12; 
+//Calibre l'IMU
+    setupMpu6050Registers();
+    calibrateMpu6050();
+    configureChannelMapping();
 
-  setupMpu6050Registers();
-  calibrateMpu6050();
-
-  radio.begin();
-  radio.openReadingPipe(1, pipeOut);
-  radio.setAutoAck(false);
-  radio.setDataRate(RF24_250KBPS);
-  radio.setPALevel(RF24_PA_LOW);
-  radio.startListening(); //Initialise le module en recepteur. 
-  
-  resetData();
-  
-  ESC1.attach(4); 
-  ESC2.attach(5); 
-  ESC3.attach(6); 
-  ESC4.attach(7); 
-
-  Dir_CAM.attach(13);
-
-  loop_timer = micros();
-  period = (1000000 / FREQ) ; 
+//Accède au registres pour créer une routine d'interruption sur les broches 5, 6, 7 et 8 (broches liées aux canaux de communication)
+    PCICR  |= (1 << PCIE0);  
+    PCMSK0 |= (1 << PCINT0); //pin 5
+    PCMSK0 |= (1 << PCINT1); //pin 6
+    PCMSK0 |= (1 << PCINT2); //pin 7
+    PCMSK0 |= (1 << PCINT3); //pin 8
+    
+//Variable d'échantillonnage 
+    period = (1000000/FREQ) ; 
+    loop_timer = micros();
 }
 
-////////////////////////////////////////////////////////VOID LOOP////////////////////////////////////////////////////////
+//VOID LOOP --------------------------------------------------------------------------------------------
 
 void loop() {
-// 1. Map les données reçues par la télécommande aux différentes valeurs qui doivent leur être associées. 
-  Remote_control();
-  
-// 2. Données brutes de l'IMU. 
-  readSensor();
-
-// 3. Calcule les angles du drone selon chaque axe. 
-  calculateAngles();
-
-// 4. Calcule les consignes de correction selon chaque axe.
-  calculateSetPoints();
-
-// 5. En déduis l'erreur entre les set_points et les angles réels. 
-  calculateErrors();
-
-// 6. Corrige les impulsions à donner aux ESC. 
-  Correcteur_PID();
-
-// 7. Gère la perte de batterie. 
-  compensateBatteryDrop();
-
-// 8. Envoie les impulsions déterminées aux ESC. 
-    Impulsion_ESC();
-}
-
-
-////////////////////////////////////////////////////////FONCTIONS////////////////////////////////////////////////////////
-
-////////////////////////////////////////////////////////MPU 6050////////////////////////////////////////////////////////
-  void setupMpu6050Registers() {
-//Permet l'initialisation du MPU 6050
-
-  Wire.beginTransmission(MPU_ADDRESS); 
-  Wire.write(0x6B);                    
-  Wire.write(0x00);                    
-  Wire.endTransmission();              
-  
-  Wire.beginTransmission(MPU_ADDRESS); 
-  Wire.write(0x1B);                    
-  Wire.write(0x08);                    
-  Wire.endTransmission();              
-     
-  Wire.beginTransmission(MPU_ADDRESS); 
-  Wire.write(0x1C);                    
-  Wire.write(0x10);                    
-  Wire.endTransmission(); 
-          
-  Wire.beginTransmission(MPU_ADDRESS); 
-  Wire.write(0x1A);                    
-  Wire.write(0x03);                    
-  Wire.endTransmission();             
-}
-
-void calibrateMpu6050(){
-//Calibre le MPU 6050 en prenant la moyenne glissante de 2000 relevés. 
-//Cette fonction sert à gérer l'offset. 
-  
-  int max_samples = 2000;
-  
-  for (int i = 0; i < max_samples; i++) {
-    
     readSensor();
-    
-    gyro_offset[X] += gyro_raw[X];
-    gyro_offset[Y] += gyro_raw[Y];
-    gyro_offset[Z] += gyro_raw[Z];
-    delay(3);
-  }
-  
-  gyro_offset[X] /= max_samples;
-  gyro_offset[Y] /= max_samples;
-  gyro_offset[Z] /= max_samples;
+    calculateAngles();
+    calculate_Consignes();
+    calculate_Errors();
+    pidController();
+    applyMotorSpeed();
+}
+
+//FONCTIONS --------------------------------------------------------------------------------------------
+
+//IMU ------------------------ 
+
+void resetGyroAngles() {
+    gyro_angle[X] = acc_angle[X];
+    gyro_angle[Y] = acc_angle[Y];
+}
+
+void setupMpu6050Registers() {
+
+    Wire.beginTransmission(MPU_ADDRESS); 
+    Wire.write(0x6B);                    
+    Wire.write(0x00);                    
+    Wire.endTransmission();              
+
+    Wire.beginTransmission(MPU_ADDRESS); 
+    Wire.write(0x1B);                    
+    Wire.write(0x08);                    
+    Wire.endTransmission();              
+
+    Wire.beginTransmission(MPU_ADDRESS); 
+    Wire.write(0x1C);                    
+    Wire.write(0x10);                    
+    Wire.endTransmission();              
+
+    Wire.beginTransmission(MPU_ADDRESS); 
+    Wire.write(0x1A);                    
+    Wire.write(0x03);                    
+    Wire.endTransmission();              
+}
+
+void calibrateMpu6050() {
+    int samples = 2000;
+
+    for (int i = 0; i < samples; i++) {
+        readSensor();
+
+        gyro_offset[X] += gyro_raw[X];
+        gyro_offset[Y] += gyro_raw[Y];
+        gyro_offset[Z] += gyro_raw[Z];
+
+        PORTD |= B11110000;      
+        delayMicroseconds(1000); 
+        PORTD &= B00001111;      
+        delay(3);
+    }
+
+    gyro_offset[X] /= samples;
+    gyro_offset[Y] /= samples;
+    gyro_offset[Z] /= samples;
 }
 
 void readSensor() {
-//Lit les données brutes renvoyées par l'accéléromètre et le gyroscope et les stock dans les tableaux associés. 
+    Wire.beginTransmission(MPU_ADDRESS); 
+    Wire.write(0x3B);                    
+    Wire.endTransmission();              
+    Wire.requestFrom(MPU_ADDRESS,14);    
+    while(Wire.available() < 14);
 
-  Wire.beginTransmission(MPU_ADDRESS); 
-  Wire.write(0x3B);                   
-  Wire.endTransmission();              
-  Wire.requestFrom(MPU_ADDRESS, 14);  
-  
-  while (Wire.available() < 14);
-  
-  acc_raw[X]  = Wire.read() << 8 | Wire.read(); // Add the low and high byte to the acc_raw[X] variable
-  acc_raw[Y]  = Wire.read() << 8 | Wire.read(); // Add the low and high byte to the acc_raw[Y] variable
-  acc_raw[Z]  = Wire.read() << 8 | Wire.read(); // Add the low and high byte to the acc_raw[Z] variable
-  temperature = Wire.read() << 8 | Wire.read(); // Add the low and high byte to the temperature variable
-  gyro_raw[X] = Wire.read() << 8 | Wire.read(); // Add the low and high byte to the gyro_raw[X] variable
-  gyro_raw[Y] = Wire.read() << 8 | Wire.read(); // Add the low and high byte to the gyro_raw[Y] variable
-  gyro_raw[Z] = Wire.read() << 8 | Wire.read(); // Add the low and high byte to the gyro_raw[Z] variable
-}
-  
-void calculateAngles(){
-//Fais les corrélation entre les angles donnés par le gyroscope et l'accéléromètre pour renvoyer l'inclinaison de l'assiette
-//selon le pitch, yaw et roll. 
-
-  calculateGyroAngles();
-  calculateAccelerometerAngles();
-  
-  if (initialized) {
-    
-    gyro_angle[X] = gyro_angle[X] * 0.9996 + acc_angle[X] * 0.0004;
-    gyro_angle[Y] = gyro_angle[Y] * 0.9996 + acc_angle[Y] * 0.0004;
-  } 
-  else {
-
-    gyro_angle[X] = acc_angle[X];
-    gyro_angle[Y] = acc_angle[Y];
-    initialized = true;
-   }
-    
-  measures[ROLL]  = measures[ROLL]  * 0.9 + gyro_angle[X] * 0.1;
-  measures[PITCH] = measures[PITCH] * 0.9 + gyro_angle[Y] * 0.1;
-  measures[YAW]   = -gyro_raw[Z] / SSF_GYRO; 
-}
-   
-void calculateGyroAngles(){
-//Utilise les données brutes récupérées par le gyroscope pour les transformer en angles en degrés. 
-  
-  gyro_raw[X] -= gyro_offset[X];
-  gyro_raw[Y] -= gyro_offset[Y];
-  gyro_raw[Z] -= gyro_offset[Z];
-  
-  gyro_angle[X] += (gyro_raw[X] / (FREQ * SSF_GYRO));
-  gyro_angle[Y] += (-gyro_raw[Y] / (FREQ * SSF_GYRO)); 
-  
-  gyro_angle[Y] += gyro_angle[X] * sin(gyro_raw[Z] * (PI / (FREQ * SSF_GYRO * 180)));
-  gyro_angle[X] -= gyro_angle[Y] * sin(gyro_raw[Z] * (PI / (FREQ * SSF_GYRO * 180)));
- }
-    
-void calculateAccelerometerAngles(){
-//Utilise les données brutes récupérées par l'accéléromètre pour les transformer en angles en degrés. 
-
-  acc_total_vector = sqrt(pow(acc_raw[X], 2) + pow(acc_raw[Y], 2) + pow(acc_raw[Z], 2));
-  
-  if (abs(acc_raw[X]) < acc_total_vector) {
-    acc_angle[X] = asin((float)acc_raw[Y] / acc_total_vector) * (180 / PI);
-  }
-  
-  if (abs(acc_raw[Y]) < acc_total_vector) {
-    acc_angle[Y] = asin((float)acc_raw[X] / acc_total_vector) * (180 / PI);
-  }
+    acc_raw[X]  = Wire.read() << 8 | Wire.read(); 
+    acc_raw[Y]  = Wire.read() << 8 | Wire.read(); 
+    acc_raw[Z]  = Wire.read() << 8 | Wire.read(); 
+    temperature = Wire.read() << 8 | Wire.read();
+    gyro_raw[X] = Wire.read() << 8 | Wire.read(); 
+    gyro_raw[Y] = Wire.read() << 8 | Wire.read(); 
+    gyro_raw[Z] = Wire.read() << 8 | Wire.read(); 
 }
 
-////////////////////////////////////////////////////////CORRECTEUR PID////////////////////////////////////////////////////////
+void calculateGyroAngles() {
+    // Subtract offsets
+    gyro_raw[X] -= gyro_offset[X];
+    gyro_raw[Y] -= gyro_offset[Y];
+    gyro_raw[Z] -= gyro_offset[Z];
+    gyro_angle[X] += (gyro_raw[X] / (FREQ * SSF_GYRO));
+    gyro_angle[Y] += (-gyro_raw[Y] / (FREQ * SSF_GYRO)); 
+    gyro_angle[Y] += gyro_angle[X] * sin(gyro_raw[Z] * (PI / (FREQ * SSF_GYRO * 180)));
+    gyro_angle[X] -= gyro_angle[Y] * sin(gyro_raw[Z] * (PI / (FREQ * SSF_GYRO * 180)));
+}
 
-float calculateSetPoint(float angle, int channel_pulse) {
-//Prend en entrée : un angle en degrés et la durée en µs de l'impulsion reçue pour l'axe (comprise entre 1000µs et 2000µs)
-//Calcule la consigne d'un angle pour un axe.
-//Interprète un angle donné pour en déduire une consigne exploitable par le correcteur PID. 
-//Retourne la consigne en degrés/seconde pour la correction.
+void calculateAccelerometerAngles() {
 
-    float level_adjust = angle * 15;
-    float set_point    = 0;
+    acc_total_vector = sqrt(pow(acc_raw[X], 2) + pow(acc_raw[Y], 2) + pow(acc_raw[Z], 2));
+    if (abs(acc_raw[X]) < acc_total_vector) {
+        acc_angle[X] = asin((float)acc_raw[Y] / acc_total_vector) * (180 / PI); 
+    }
 
-    // On s'accorde une marge 16µs pour de meilleurs résultats
+    if (abs(acc_raw[Y]) < acc_total_vector) {
+        acc_angle[Y] = asin((float)acc_raw[X] / acc_total_vector) * (180 / PI);
+    }
+}
+
+void calculateAngles() {
+    calculateGyroAngles();
+    calculateAccelerometerAngles();
+
+    if (initialized) {
+//Utilisation d'un filtre complémentaire 
+        gyro_angle[X] = gyro_angle[X] * 0.9996 + acc_angle[X] * 0.0004;
+        gyro_angle[Y] = gyro_angle[Y] * 0.9996 + acc_angle[Y] * 0.0004;
+    } else {
+        resetGyroAngles();
+        initialized = true;
+    }
+
+    data_measures[ROLL]  = data_measures[ROLL]  * 0.9 + gyro_angle[X] * 0.1;
+    data_measures[PITCH] = data_measures[PITCH] * 0.9 + gyro_angle[Y] * 0.1;
+    data_measures[YAW]   = -gyro_raw[Z] / SSF_GYRO; 
+
+    angle_IMU[ROLL]  = 0.7 * angle_IMU[ROLL]  + 0.3 * gyro_raw[X] / SSF_GYRO;
+    angle_IMU[PITCH] = 0.7 * angle_IMU[PITCH] + 0.3 * gyro_raw[Y] / SSF_GYRO;
+    angle_IMU[YAW]   = 0.7 * angle_IMU[YAW]   + 0.3 * gyro_raw[Z] / SSF_GYRO;
+}
+
+//PID ------------------------ 
+
+float calculate_Consigne(float angle, int channel_pulse) {
+    float level_adjust = angle * 15; // Value 15 limits maximum angle value to ±32.8°
+    float consigne    = 0;
+
+    // Need a dead band of 16µs for better result
     if (channel_pulse > 1508) {
-        set_point = channel_pulse - 1508;
+        consigne = channel_pulse - 1508;
     } else if (channel_pulse <  1492) {
-        set_point = channel_pulse - 1492;
+        consigne = channel_pulse - 1492;
     }
 
-    set_point -= level_adjust;
-    set_point /= 3;
+    consigne -= level_adjust;
+    consigne /= 3;
 
-    return set_point;
+    return consigne;
 }
 
-float calculateYawSetPoint(int yaw_pulse, int throttle_pulse) {
-//Calcul le set_point pour l'axe YAW. 
-    float set_point = 0;
+float calculateYaw_Consigne(int yaw_pulse, int throttle_pulse) {
+    float consigne = 0;
+
     if (throttle_pulse > 1050) {
-//Il n'y a pas de notion d'angle sur le YAW car le drone peut tourner sur lui même
-        set_point = calculateSetPoint(0, yaw_pulse);
+        consigne = calculate_Consigne(0, yaw_pulse);
     }
-    return set_point;
+
+    return consigne;
 }
 
-void calculateSetPoints() {
-//Calcule le set_point selon tous les axes.
-    pid_set_points[YAW]   = calculateYawSetPoint(pulse_length[YAW], pulse_length[THROTTLE]);
-    pid_set_points[PITCH] = calculateSetPoint(measures[PITCH], pulse_length[PITCH]);
-    pid_set_points[ROLL]  = calculateSetPoint(measures[ROLL], pulse_length[ROLL]);
+void calculate_Consignes() {
+    pid_consignes[YAW]   = calculateYaw_Consigne(motor_pulse[mode_mapping[YAW]], motor_pulse[mode_mapping[THROTTLE]]);
+    pid_consignes[PITCH] = calculate_Consigne(data_measures[PITCH], motor_pulse[mode_mapping[PITCH]]);
+    pid_consignes[ROLL]  = calculate_Consigne(data_measures[ROLL], motor_pulse[mode_mapping[ROLL]]);
 }
 
-void calculateErrors() {
-//Calcule les erreurs relatives a chaque axe. 
-//Pour calculer les erreurs, se base sur la formule du PID 
-  
-//Calcule l'erreur actuelle.
-    errors[YAW]   = angular_motions[YAW]   - pid_set_points[YAW];
-    errors[PITCH] = angular_motions[PITCH] - pid_set_points[PITCH];
-    errors[ROLL]  = angular_motions[ROLL]  - pid_set_points[ROLL];
+void calculate_Errors(){
 
-//Calcule la somme des erreurs (intégration)
+    errors[YAW]   = angle_IMU[YAW]   - pid_consignes[YAW];
+    errors[PITCH] = angle_IMU[PITCH] - pid_consignes[PITCH];
+    errors[ROLL]  = angle_IMU[ROLL]  - pid_consignes[ROLL];
+    
     error_sum[YAW]   += errors[YAW];
     error_sum[PITCH] += errors[PITCH];
     error_sum[ROLL]  += errors[ROLL];
@@ -355,33 +289,29 @@ void calculateErrors() {
     error_sum[PITCH] = minMax(error_sum[PITCH], -400/Ki[PITCH], 400/Ki[PITCH]);
     error_sum[ROLL]  = minMax(error_sum[ROLL],  -400/Ki[ROLL],  400/Ki[ROLL]);
 
-//(dérivation)
     delta_err[YAW]   = errors[YAW]   - previous_error[YAW];
     delta_err[PITCH] = errors[PITCH] - previous_error[PITCH];
     delta_err[ROLL]  = errors[ROLL]  - previous_error[ROLL];
 
+    // Save current error as previous_error for next time
     previous_error[YAW]   = errors[YAW];
     previous_error[PITCH] = errors[PITCH];
     previous_error[ROLL]  = errors[ROLL];
 }
 
-
-void Correcteur_PID() {
-//Renvoie les impulsions de correction de l'assiette du drone. 
-
+void pidController() {
+  
     float yaw_pid      = 0;
     float pitch_pid    = 0;
     float roll_pid     = 0;
-    int   throttle     = pulse_length[THROTTLE];
+    int   throttle     = motor_pulse[mode_mapping[THROTTLE]];
 
-    pulse_length_esc1 = throttle;
-    pulse_length_esc2 = throttle;
-    pulse_length_esc3 = throttle;
-    pulse_length_esc4 = throttle;
+    pulse_ESC1 = throttle;
+    pulse_ESC2 = throttle;
+    pulse_ESC3 = throttle;
+    pulse_ESC4 = throttle;                          
 
-//Ne calcule rien si la commande des gazs (throttle) est égale à 0
     if (throttle >= 1012) {
-        // PID = e.Kp + ∫e.Ki + Δe.Kd
         yaw_pid   = (errors[YAW]   * Kp[YAW])   + (error_sum[YAW]   * Ki[YAW])   + (delta_err[YAW]   * Kd[YAW]);
         pitch_pid = (errors[PITCH] * Kp[PITCH]) + (error_sum[PITCH] * Ki[PITCH]) + (delta_err[PITCH] * Kd[PITCH]);
         roll_pid  = (errors[ROLL]  * Kp[ROLL])  + (error_sum[ROLL]  * Ki[ROLL])  + (delta_err[ROLL]  * Kd[ROLL]);
@@ -390,157 +320,120 @@ void Correcteur_PID() {
         pitch_pid = minMax(pitch_pid, -400, 400);
         roll_pid  = minMax(roll_pid, -400, 400);
 
-        pulse_length_esc1 = throttle - roll_pid - pitch_pid + yaw_pid;
-        pulse_length_esc2 = throttle + roll_pid - pitch_pid - yaw_pid;
-        pulse_length_esc3 = throttle - roll_pid + pitch_pid - yaw_pid;
-        pulse_length_esc4 = throttle + roll_pid + pitch_pid + yaw_pid;
+        pulse_ESC1 = throttle - roll_pid - pitch_pid + yaw_pid;
+        pulse_ESC2 = throttle + roll_pid - pitch_pid - yaw_pid;
+        pulse_ESC3 = throttle - roll_pid + pitch_pid - yaw_pid;
+        pulse_ESC4 = throttle + roll_pid + pitch_pid + yaw_pid;
     }
 
-//Garde les impulsion dans le range acceptable de valeur. 
-    pulse_length_esc1 = minMax(pulse_length_esc1, 1100, 2000);
-    pulse_length_esc2 = minMax(pulse_length_esc2, 1100, 2000);
-    pulse_length_esc3 = minMax(pulse_length_esc3, 1100, 2000);
-    pulse_length_esc4 = minMax(pulse_length_esc4, 1100, 2000);
+    pulse_ESC1 = minMax(pulse_ESC1, 1100, 2000);
+    pulse_ESC2 = minMax(pulse_ESC2, 1100, 2000);
+    pulse_ESC3 = minMax(pulse_ESC3, 1100, 2000);
+    pulse_ESC4 = minMax(pulse_ESC4, 1100, 2000);
 }
 
-////////////////////////////////////////////////////////COMPENSATION PERTE BATTERIE////////////////////////////////////////////////////////
+void resetPidController() {
+    errors[YAW]   = 0;
+    errors[PITCH] = 0;
+    errors[ROLL]  = 0;
 
-void compensateBatteryDrop() {
-//Compense la perte de batterie du drone en appliquant un coefficient aux impulsions des ESC. 
+    error_sum[YAW]   = 0;
+    error_sum[PITCH] = 0;
+    error_sum[ROLL]  = 0;
 
-    if (isBatteryConnected()) {
-        int coeff = ((1240 - battery_voltage) / (float) 3500);
+    previous_error[YAW]   = 0;
+    previous_error[PITCH] = 0;
+    previous_error[ROLL]  = 0;
+}
 
-        pulse_length_esc1 += pulse_length_esc1 * coeff;
-        pulse_length_esc2 += pulse_length_esc2 * coeff;
-        pulse_length_esc3 += pulse_length_esc3 * coeff;
-        pulse_length_esc4 += pulse_length_esc4 * coeff;
+//RC ------------------------ 
+
+void configureChannelMapping() {
+    mode_mapping[YAW]      = CHANNEL4;
+    mode_mapping[PITCH]    = CHANNEL2;
+    mode_mapping[ROLL]     = CHANNEL1;
+    mode_mapping[THROTTLE] = CHANNEL3;
+}
+
+
+ISR(PCINT0_vect) {
+        current_time = micros();
+
+        // Channel 1 -------------------------------------------------
+        if (PINB & B00000001) {                                        
+            if (previous_state[CHANNEL1] == LOW) {                     
+                previous_state[CHANNEL1] = HIGH;                      
+                timer[CHANNEL1] = current_time;                        
+            }
+        } 
+        else if (previous_state[CHANNEL1] == HIGH) {                 
+            previous_state[CHANNEL1] = LOW;                            
+            motor_pulse[CHANNEL1] = current_time - timer[CHANNEL1];   
+        }
+
+        // Channel 2 -------------------------------------------------
+        if (PINB & B00000010) {                                        
+            if (previous_state[CHANNEL2] == LOW) {                     
+                previous_state[CHANNEL2] = HIGH;                       
+                timer[CHANNEL2] = current_time;                        
+            }
+        } 
+        else if (previous_state[CHANNEL2] == HIGH) {                
+            previous_state[CHANNEL2] = LOW;                            
+            motor_pulse[CHANNEL2] = current_time - timer[CHANNEL2];   
+        }
+
+        // Channel 3 -------------------------------------------------
+        if (PINB & B00000100) {                                        
+            if (previous_state[CHANNEL3] == LOW) {                     
+                previous_state[CHANNEL3] = HIGH;                       
+                timer[CHANNEL3] = current_time;                        
+            }
+        } 
+        else if (previous_state[CHANNEL3] == HIGH) {                 
+            previous_state[CHANNEL3] = LOW;                            
+            motor_pulse[CHANNEL3] = current_time - timer[CHANNEL3];   
+        }
+
+        // Channel 4 -------------------------------------------------
+        if (PINB & B00001000) {                                        
+            if (previous_state[CHANNEL4] == LOW) {                     
+                previous_state[CHANNEL4] = HIGH;                       
+                timer[CHANNEL4] = current_time;                        
+            }
+        } 
+        else if (previous_state[CHANNEL4] == HIGH) {                 
+            previous_state[CHANNEL4] = LOW;                            
+            motor_pulse[CHANNEL4] = current_time - timer[CHANNEL4];   
+        }
+}
+
+//ESC ------------------------ 
+
+void stopAll() {
+    pulse_ESC1 = 1000;
+    pulse_ESC2 = 1000;
+    pulse_ESC3 = 1000;
+    pulse_ESC4 = 1000;
+}
+
+void applyMotorSpeed() {
+
+    while ((now = micros()) - loop_timer < period);
+    loop_timer = now;
+    PORTD |= B11110000;
+    while (PORTD >= 16) {
+        now        = micros();
+        difference = now - loop_timer;
+
+        if (difference >= pulse_ESC1) PORTD &= B11101111; 
+        if (difference >= pulse_ESC2) PORTD &= B11011111; 
+        if (difference >= pulse_ESC3) PORTD &= B10111111; 
+        if (difference >= pulse_ESC4) PORTD &= B01111111; 
     }
 }
 
-bool isBatteryConnected() {
-//Vérifie que la batterie soit bien connectée. 
-//Renvoie TRUE si la batterie est connectée.
-  
-    // On applique un simple filtre passe-bas pour filtrer le signal (Fc ≈ 10Hz et gain de ~2.5dB dans la bande passante)
-    battery_voltage = battery_voltage * 0.92 + (analogRead(0) + 65) * 0.09853;
-
-    return battery_voltage < 1240 && battery_voltage > 800;
-}
-
-////////////////////////////////////////////////////////IMPULSION ESC////////////////////////////////////////////////////////
-
-void Impulsion_ESC(){
-  ESC1.write(pulse_length_esc1);
-  ESC2.write(pulse_length_esc2);
-  ESC3.write(pulse_length_esc3);
-  ESC4.write(pulse_length_esc4);
-}
-
-////////////////////////////////////////////////////////RADIO////////////////////////////////////////////////////////
-
-void Remote_control(){
-//Reçoit les remote controls et les interprète pour venir les mettre dans le tableau pulse_lenght[4].
-
-  currentTime = millis();
-  if ( currentTime - lastReceiveTime > 1000 ) { 
-    resetData(); //Reset les commandes si la connection est perdue. 
-  }
-
-//Vérifie s'il y a des données à recevoir.
-  if (radio.available()) {
-    radio.read(&data, sizeof(Data_package)); //Lit les données reçues et les stock dans la structure data.
-    lastReceiveTime = millis();
-  }
-
-  if (AIGLE_POURFENDEUR_DES_PLAINES_ARIDES()==0){
-
-    mapping_commands();
-    
-  }
-  else{
-//Ici ce trouveront toute les commande pour le tracking IA
-  }
-}
-
-void resetData() {
-  // Reset l'ensemble des commandes remote. 
-  data.throttle = 0;
-  data.yaw = 127;
-  data.pitch = 127;
-  data.roll = 127;
-  data.val_IA = 0;
-
-  mapping_commands();
-}
-
-void mapping_commands(){
-//Map les valeurs des joysticks aux valeurs aux valeurs d'impulsion des ESC.
-    pulse_length[THROTTLE] = map(data.throttle, 0, 255, 1000, 2000);//Pour le throttle.
-    pulse_length[YAW] = map(data.yaw, 0, 255, 1000, 2000);//Pour le yaw.
-    pulse_length[PITCH] = map(data.pitch, 0, 255, 1000, 2000);//Pour le pitch.
-    pulse_length[ROLL] = map(data.roll, 0, 255, 1000, 2000);//Pour le roll.
-}
-
-void setupPPM() {
-//Initialise la procédure d'interruption commande du drone. 
-
-  pinMode(sigPin, OUTPUT);
-  digitalWrite(sigPin, 0);  
-
-//J'utilise ici du langage processeur. Problème : ce langage est prévu pour les processeurs d'arduino uno et non d'arduino Nano Every ! 
-//Il va donc falloir que j'aille voir dans les register de la Nano Every pour voir quelle commande processeur sont équivalentes 
-//à celles que j'utilise ci-dessous. 
-  cli();
-  TCCR1A = 0; 
-  TCCR1B = 0;
-
-  OCR1A = 100;  
-  TCCR1B |= (1 << WGM12); 
-  TCCR1B |= (1 << CS11);  
-  TIMSK1 |= (1 << OCIE1A); 
-  sei();
-}
-
-//Cette partie de code ne vient pas de moi, mais permet les interruptions commande du programme. 
-
-#define clockMultiplier 2 // set this to 2 if you are using a 16MHz arduino, leave as 1 for an 8MHz arduino
-
-ISR(TIMER1_COMPA_vect){
-  static boolean state = true;
-
-  TCNT1 = 0;
-
-  if ( state ) {
-    //end pulse
-    PORTD = PORTD & ~B00000100; // turn pin 2 off. Could also use: digitalWrite(sigPin,0)
-    OCR1A = PPM_PulseLen * clockMultiplier;
-    state = false;
-  }
-  else {
-    //start pulse
-    static byte cur_chan_numb;
-    static unsigned int calc_rest;
-
-    PORTD = PORTD | B00000100; // turn pin 2 on. Could also use: digitalWrite(sigPin,1)
-    state = true;
-
-    if(cur_chan_numb >= channel_number) {
-      cur_chan_numb = 0;
-      calc_rest += PPM_PulseLen;
-      OCR1A = (PPM_FrLen - calc_rest) * clockMultiplier;
-      calc_rest = 0;
-    }
-    else {
-      OCR1A = (ppm[cur_chan_numb] - PPM_PulseLen) * clockMultiplier;
-      calc_rest += ppm[cur_chan_numb];
-      cur_chan_numb++;
-    }     
-  }
-}
-
-
-////////////////////////////////////////////////////////FONCTION MATHS////////////////////////////////////////////////////////
+//MATHS ------------------------ 
 
 float minMax(float value, float min_value, float max_value) {
     if (value > max_value) {
@@ -548,19 +441,6 @@ float minMax(float value, float min_value, float max_value) {
     } else if (value < min_value) {
         value = min_value;
     }
+
     return value;
-}
-
-////////////////////////////////////////////////////////FONCTIONS MODES DE VOL////////////////////////////////////////////////////////
-
-int AIGLE_POURFENDEUR_DES_PLAINES_ARIDES(){
-//Permet la sélection des différents mode du drone. 
-//Si la fonction renvoie 1, alors les commandes joystick ne seront plus prises en compte. Dans le cas contraire, 
-//les commandes joysticks sont toujours utilisées. 
- 
-  if (data.val_IA == 1) {
-    //MODE IA DRONE SUIVI
-    return 1;
-  }
-  return 0;
 }
