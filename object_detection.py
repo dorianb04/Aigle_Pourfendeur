@@ -3,8 +3,6 @@ import cv2
 
 import time
 
-# Voici un commentaire inutile
-
 def trackPerson(ratio_area, delta_x, delta_y, ratio_area_range=[1, 2], range_delta_coord_X=[-15, 15],
               range_delta_coord_Y=[-15, 15]):
     if ratio_area != 0:
